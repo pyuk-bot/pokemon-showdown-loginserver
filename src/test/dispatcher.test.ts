@@ -1,89 +1,158 @@
 /**
- * Tests for context functions.
- * By Mia.
- * @author mia-pi-git
+ * Tests for HTTP request dispatch.
  */
-import { strict as assert } from 'assert';
-import { Config } from '../config-loader';
-import { ActionContext, ActionError, SimServers } from '../server';
-import * as path from 'path';
+import { strict as assert } from 'node:assert';
+import * as http from 'node:http';
+import { after, before, suite, test } from 'node:test';
 
-import * as utils from './test-utils';
+import { Config } from '../config-loader.ts';
+import { Server } from '../server.ts';
 
-const servertoken = 'jiuhygjhf';
-describe('Dispatcher features', () => {
-	const context = utils.makeDispatcher({
-		serverid: 'etheria',
-		servertoken,
-		act: 'mmr',
+const SERVERTOKEN = 'jiuhygjhf';
+
+async function waitForListening(server: Server) {
+	await new Promise<void>((resolve, reject) => {
+		const cleanup = () => {
+			server.server.off('listening', onListening);
+			server.server.off('error', onError);
+		};
+		const onListening = () => {
+			cleanup();
+			resolve();
+		};
+		const onError = (error: Error) => {
+			cleanup();
+			reject(error);
+		};
+		server.server.once('listening', onListening);
+		server.server.once('error', onError);
 	});
-	const server = utils.addServer({
-		id: 'etheria',
-		name: 'Etheria',
-		port: 8000,
-		server: 'despondos.psim.us',
-		token: servertoken,
+}
+
+async function closeServer(server: Server) {
+	await new Promise<void>(resolve => {
+		server.server.close(() => resolve());
 	});
-	it('Should properly detect servers', async () => {
-		const cur = await context.getServer();
-		assert(server.id === cur?.id);
+}
+
+async function request(server: Server, path: string, headers: http.OutgoingHttpHeaders = {}) {
+	const address = server.server.address();
+	assert(address && typeof address === 'object');
+	return new Promise<{
+		statusCode: number | undefined,
+		body: string,
+		headers: http.IncomingHttpHeaders,
+	}>((resolve, reject) => {
+		const req = http.request({
+			host: '127.0.0.1',
+			port: address.port,
+			path,
+			headers,
+		}, response => {
+			let body = '';
+			response.setEncoding('utf8');
+			response.on('data', chunk => {
+				body += chunk;
+			});
+			response.on('end', () => resolve({
+				statusCode: response.statusCode,
+				body,
+				headers: response.headers,
+			}));
+		});
+		req.on('error', reject);
+		req.end();
 	});
-	it('Should validate servertokens', async () => {
-		const cur = await context.getServer(true);
-		assert(cur);
-		assert(server.id === cur.id);
-		// invalidate the servertoken, we shouldn't find the server now
-		// eslint-disable-next-line require-atomic-updates
-		context.body.servertoken = '';
-		const result = await context.getServer(true).catch(e => e);
-		assert(result instanceof ActionError);
+}
+
+function parseResponse(body: string): any {
+	assert.equal(body.charAt(0), ']');
+	return JSON.parse(body.slice(1));
+}
+
+void suite('Dispatcher features', () => {
+	let server: Server;
+
+	void before(async () => {
+		server = new Server(0, '127.0.0.1');
+		await waitForListening(server);
 	});
 
-	it('Should validate CORS requests', () => {
-		Config.cors = [
-			[/etheria/, 'server_'],
-		];
-		context.request.headers['origin'] = 'https://etheria.psim.us/';
-		let prefix = context.verifyCrossDomainRequest();
-		assert(prefix === 'server_', `Wrong challengeprefix: ${prefix}`);
-		assert(context.response.hasHeader('Access-Control-Allow-Origin'), 'missing CORS header');
+	void after(async () => {
+		await closeServer(server);
+	});
 
-		context.response.removeHeader('Access-Control-Allow-Origin');
-		context.request.headers['origin'] = 'nevergonnagiveyouup';
-
-		context.setPrefix('');
-		prefix = context.verifyCrossDomainRequest();
-		assert(prefix === '', `has improper challengeprefix: ${prefix}`);
-		const header = context.response.hasHeader('Access-Control-Allow-Origin');
-		assert(!header, `has CORS header where it should not: ${header}`);
-	});
-	it('Should support requesting /api/[action]', async () => {
-		const req = context.request;
-		req.url = '/api/mmr?userid=mia';
-		const body = await ActionContext.getBody(req);
-		assert(!Array.isArray(body));
-		assert(body.act === 'mmr');
-	});
-	it('Should support requesting action.php with an `act` param', async () => {
-		const req = context.request;
-		req.url = '/action.php?act=mmr&userid=mia';
-		const body = await ActionContext.getBody(req);
-		assert(!Array.isArray(body));
-		assert(body.act === 'mmr');
-		assert(body.userid === 'mia');
-	});
-	it("Should load servers properly", () => {
-		const servers = SimServers.loadServers(
-			path.join(__dirname, '/../../', 'src/test/fixtures/servers.php')
+	void test('Should properly detect servers', async () => {
+		const response = await request(
+			server,
+			`/api/invalidatecss?serverid=etheria&servertoken=${SERVERTOKEN}`
 		);
-		assert.deepStrictEqual({
-			showdown: {
-				name: 'Smogon University',
-				id: 'showdown',
-				server: 'sim.psim.us',
-				port: 8000,
-				owner: 'mia',
-			},
-		}, servers);
+		assert.equal(response.statusCode, 200);
+		assert.deepEqual(parseResponse(response.body), { actionsuccess: false });
+	});
+
+	void test('Should validate servertokens', async () => {
+		const response = await request(
+			server,
+			'/api/mmr?format=gen9ou&user=mia&serverid=etheria&servertoken=invalid'
+		);
+		assert.equal(response.statusCode, 200);
+		assert.deepEqual(parseResponse(response.body), {
+			actionerror: 'Invalid servertoken sent for requested serverid.',
+		});
+	});
+
+	void test('Should validate CORS requests', async () => {
+		Config.cors = [[/etheria/, 'server_']];
+		const allowed = await request(server, '/api/register', { origin: 'https://etheria.psim.us/' });
+		assert.equal(allowed.headers['access-control-allow-origin'], 'https://etheria.psim.us/');
+
+		const rejected = await request(server, '/api/register', { origin: 'nevergonnagiveyouup' });
+		assert.equal(rejected.headers['access-control-allow-origin'], undefined);
+	});
+
+	void test('Should support requesting /api/[action]', async () => {
+		const response = await request(server, '/api/mmr?format=gen9ou&user=mia&serverid=showdown');
+		assert.equal(response.statusCode, 200);
+		assert.equal(parseResponse(response.body), 1000);
+	});
+
+	void test('Should not inspect sessions for user-independent actions', async () => {
+		const response = await request(
+			server,
+			'/api/mmr?format=gen9ou&user=mia&serverid=showdown&sid=Mia,999999,invalid'
+		);
+		assert.equal(response.statusCode, 200);
+		assert.equal(parseResponse(response.body), 1000);
+		assert.equal(response.headers['access-control-allow-origin'], '*');
+		// invalid SID would normally get cleared if it was read
+		assert.equal(response.headers['set-cookie'], undefined);
+	});
+
+	void test('Should support requesting action.php with an `act` param', async () => {
+		const response = await request(
+			server, '/action.php?act=mmr&format=gen9ou&user=mia&serverid=showdown'
+		);
+		assert.equal(response.statusCode, 200);
+		assert.equal(parseResponse(response.body), 1000);
+	});
+
+	void test('Should load servers properly', async () => {
+		const response = await request(
+			server,
+			`/api/mmr?format=gen9ou&user=mia&serverid=etheria&servertoken=${SERVERTOKEN}`
+		);
+		assert.equal(response.statusCode, 200);
+		assert.deepEqual(parseResponse(response.body), {
+			errorip: 'This ladder is not for your server. You should turn off Config.remoteladder.',
+		});
+	});
+
+	void test('Should allow CORS for missing public replay resources', async () => {
+		for (const endpoint of ['get.json', 'get.log', 'get.inputlog']) {
+			const response = await request(server, `/api/replays/${endpoint}?id=missing`);
+			assert.equal(response.statusCode, 404);
+			assert.equal(response.headers['access-control-allow-origin'], '*');
+		}
 	});
 });

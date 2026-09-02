@@ -1,20 +1,48 @@
 /**
  * Login server database tables
  */
-import { MySQLDatabase, PGDatabase } from './database';
-import { Config } from './config-loader';
+import { MockDatabase, MySQLDatabase, PGDatabase, SQLiteDatabase } from './database.ts';
+import { Config } from './config-loader.ts';
 
-import type { LadderEntry } from './ladder';
+import type { LadderEntry } from './ladder.ts';
 import type { ReplayRow } from './replays';
 import type { SuspectParticipation, Suspect } from './actions';
 
-// direct access
-export const psdb = new MySQLDatabase(Config.mysql);
-export const pgdb = new PGDatabase(Config.postgres!);
-export const replaysDB = Config.replaysdb ? new PGDatabase(Config.replaysdb) : pgdb;
-export const ladderDB = Config.ladderdb ? new MySQLDatabase(Config.ladderdb!) : psdb;
+type DatabaseDriver = 'mysql' | 'postgres' | 'sqlite' | 'mock';
+type DatabaseConfig = {
+	driver: DatabaseDriver,
+	prefix?: string,
+	[k: string]: any,
+};
+type RealDatabase = MySQLDatabase | PGDatabase;
 
-export const users = psdb.getTable<{
+function stripDriver(config: DatabaseConfig) {
+	const { driver, ...dbConfig } = config;
+	return dbConfig;
+}
+
+function createDatabase<DB extends RealDatabase>(
+	config: DatabaseConfig, name: string
+): DB {
+	const driver = config.driver;
+	if (driver === 'mock') return new MockDatabase(config, name) as unknown as DB;
+	if (!config) throw new Error(`Database config "${name}" is required for ${driver}.`);
+	if (driver === 'sqlite') return new SQLiteDatabase(stripDriver(config)) as unknown as DB;
+	if (driver === 'mysql') return new MySQLDatabase(stripDriver(config)) as DB;
+	if (driver === 'postgres') return new PGDatabase(stripDriver(config) as any) as DB;
+	throw new Error(`Unsupported database driver for ${name}.`);
+}
+
+// direct access
+export const loginDB = createDatabase<MySQLDatabase>(Config.logindb, 'mysql');
+export const friendsDB = Config.friendsdb ?
+	createDatabase<PGDatabase>(Config.friendsdb, 'postgres') : loginDB;
+export const replaysDB = Config.replaysdb ?
+	createDatabase<PGDatabase>(Config.replaysdb, 'replaysdb') : friendsDB;
+export const ladderDB = Config.ladderdb ?
+	createDatabase<MySQLDatabase>(Config.ladderdb, 'ladderdb') : loginDB;
+
+export const users = loginDB.getTable<{
 	userid: string,
 	usernum: number,
 	username: string,
@@ -57,6 +85,28 @@ export const replayPrep = replaysDB.getTable<{
 	uploadtime: number,
 }>('replayprep', 'id');
 
+// must be a type and not an interface to qualify as an SQLRow
+export type ReplayRow = {
+	id: string,
+	format: string,
+	/** player names delimited by `,`; starting with `!` denotes that player wants the replay private */
+	players: string,
+	log: string,
+	inputlog: string | null,
+	uploadtime: number,
+	views: number,
+	formatid: string,
+	rating: number | null,
+	/**
+	 * 0 = public
+	 * 1 = private (with or without password)
+	 * 2 = NOT USED; ONLY USED IN PREPREPLAY
+	 * 3 = deleted
+	 * 10 = autosaved
+	 */
+	private: 0 | 1 | 2 | 3 | 10,
+	password: string | null,
+};
 export const replays = replaysDB.getTable<
 	ReplayRow
 >('replays', 'id');
@@ -74,7 +124,7 @@ export const replayPlayers = replaysDB.getTable<{
 	players: string,
 }>('replayplayers');
 
-export const sessions = psdb.getTable<{
+export const sessions = loginDB.getTable<{
 	session: number,
 	sid: string,
 	userid: string,
@@ -83,27 +133,27 @@ export const sessions = psdb.getTable<{
 	ip: string,
 }>('sessions', 'session');
 
-export const userstats = psdb.getTable<{
+export const userstats = loginDB.getTable<{
 	id: number,
 	serverid: string,
 	usercount: number,
 	date: number,
 }>('userstats', 'id');
 
-export const loginthrottle = psdb.getTable<{
+export const loginthrottle = loginDB.getTable<{
 	ip: string,
 	count: number,
 	time: number,
 	lastuserid: string,
 }>('loginthrottle', 'ip');
 
-export const loginattempts = psdb.getTable<{
+export const loginattempts = loginDB.getTable<{
 	count: number,
 	time: number,
 	userid: string,
 }>('loginattempts', 'userid');
 
-export const usermodlog = psdb.getTable<{
+export const usermodlog = loginDB.getTable<{
 	entryid: number,
 	userid: string,
 	actorid: string,
@@ -112,7 +162,7 @@ export const usermodlog = psdb.getTable<{
 	entry: string,
 }>('usermodlog', 'entryid');
 
-export const userstatshistory = psdb.getTable<{
+export const userstatshistory = loginDB.getTable<{
 	id: number,
 	date: number,
 	usercount: number,
@@ -121,21 +171,21 @@ export const userstatshistory = psdb.getTable<{
 
 // oauth stuff
 
-export const oauthClients = psdb.getTable<{
+export const oauthClients = loginDB.getTable<{
 	owner: string, // ps username
 	client_title: string,
 	id: string, // hex hash
 	origin_url: string,
 }>('oauth_clients', 'id');
 
-export const oauthTokens = psdb.getTable<{
+export const oauthTokens = loginDB.getTable<{
 	owner: string,
 	client: string, // id of client
 	id: string,
 	time: number,
 }>('oauth_tokens', 'id');
 
-export const teams = pgdb.getTable<{
+export const teams = friendsDB.getTable<{
 	teamid: string,
 	ownerid: string,
 	team: string,
@@ -145,6 +195,6 @@ export const teams = pgdb.getTable<{
 	views: number,
 }>('teams', 'teamid');
 
-export const suspects = psdb.getTable<Suspect>("suspects", 'formatid');
+export const suspects = loginDB.getTable<Suspect>("suspects", 'formatid');
 
-export const suspectParticipation = psdb.getTable<SuspectParticipation>("suspect_participation", 'entryid');
+export const suspectParticipation = loginDB.getTable<SuspectParticipation>("suspect_participation", 'entryid');

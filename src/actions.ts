@@ -4,21 +4,24 @@
  * By Mia
  * @author mia-pi-git
  */
-import { promises as fs, readFileSync, watchFile } from 'fs';
-import * as pathModule from 'path';
-import * as crypto from 'crypto';
-import * as url from 'url';
-import { Config } from './config-loader';
-import { Ladder, type LadderEntry } from './ladder';
-import { Replays } from './replays';
-import { ActionError, type QueryHandler, Server, DISPATCH_PREFIX } from './server';
-import { Session } from './user';
+import { promises as fs, readFileSync, watchFile } from 'node:fs';
+import * as pathModule from 'node:path';
+import * as crypto from 'node:crypto';
+import * as module from 'node:module';
+import { Config } from './config-loader.ts';
+import { Ladder, type LadderEntry } from './ladder.ts';
+import { OAuth } from './oauth.ts';
+import { Replays } from './replays.ts';
+import { ActionError, type QueryHandler, Server, DISPATCH_PREFIX } from './server.ts';
+import { Session } from './user.ts';
 import {
-	toID, updateserver, bash, time, escapeHTML, signAsync, TimeSorter,
-} from './utils';
-import * as tables from './tables';
-import { SQL } from './database';
-import IPTools from './ip-tools';
+	toID, updateserver, bash, time, signAsync, TimeSorter,
+} from './utils.ts';
+import * as tables from './tables.ts';
+import { SQL } from './database.ts';
+import IPTools from './ip-tools.ts';
+
+const require = module.createRequire(import.meta.url);
 
 export interface Suspect {
 	formatid: string;
@@ -37,29 +40,6 @@ export interface SuspectParticipation {
 	t: number;
 	qualified: 0 | 1;
 }
-
-const OAUTH_TOKEN_TIME = 2 * 7 * 24 * 60 * 60 * 1000;
-
-async function getOAuthClient(clientId?: string, origin?: string) {
-	if (!clientId) throw new ActionError("No client_id provided.");
-	const data = await tables.oauthClients.get(clientId);
-	if (!data) throw new ActionError("Invalid client_id");
-	if (origin) {
-		if (new url.URL(origin).host !== new url.URL(data.origin_url).host) {
-			throw new ActionError("This origin is not permitted to use this OAuth client.");
-		}
-	}
-	return data;
-}
-
-const OAUTH_AUTHORIZE_CONTENT = readFileSync(
-	__dirname + "/../../src/public/oauth-authorize.html",
-	'utf-8'
-);
-const OAUTH_AUTHORIZED_CONTENT = readFileSync(
-	__dirname + "/../../src/public/oauth-authorized.html",
-	'utf-8'
-);
 
 function loadData(path: string | null) {
 	try {
@@ -102,7 +82,7 @@ const redundantFetch = async (targetUrl: string, data: RequestInit, attempts = 0
 	} catch (e: any) {
 		console.log('error in smogon fetch', e);
 		if (e.code === 400) return null;
-		return redundantFetch(targetUrl, data, attempts++);
+		return redundantFetch(targetUrl, data, attempts + 1);
 	}
 	return out;
 };
@@ -272,10 +252,11 @@ export const actions: { [k: string]: QueryHandler } = {
 	},
 
 	async logout(params) {
-		if (
-			this.request.method !== "POST" || !params.userid ||
-			params.userid !== this.user.id || this.user.id === 'guest'
-		) {
+		if (this.request.method !== "POST" || !params.userid) {
+			return { actionsuccess: false };
+		}
+		const user = await this.getUser();
+		if (params.userid !== user.id || user.id === 'guest') {
 			return { actionsuccess: false };
 		}
 		await this.session.logout(true);
@@ -332,7 +313,7 @@ export const actions: { [k: string]: QueryHandler } = {
 	async upkeep(params) {
 		const challengeprefix = this.verifyCrossDomainRequest();
 		const res = { assertion: '', username: '', loggedin: false };
-		const curuser = this.user;
+		const curuser = await this.getUser();
 		let userid = '';
 		if (curuser.id !== 'guest') {
 			res.username = curuser.name;
@@ -440,20 +421,21 @@ export const actions: { [k: string]: QueryHandler } = {
 			throw new ActionError(`Repeat your new password.`);
 		}
 
-		if (!this.user.loggedIn) {
+		const user = await this.getUser();
+		if (!user.loggedIn) {
 			throw new ActionError('Your session has expired. Please log in again.');
 		}
 		if (params.password !== params.cpassword) {
 			throw new ActionError('Your new passwords do not match.');
 		}
-		if (!(await this.session.passwordVerify(this.user.id, params.oldpassword))) {
+		if (!(await this.session.passwordVerify(user.id, params.oldpassword))) {
 			throw new ActionError('Your old password was incorrect.');
 		}
 		params.password = params.password.replace(/\s/ig, '');
 		if (params.password.length < 5) {
 			throw new ActionError('Your new password must be at least 5 characters long.');
 		}
-		const actionsuccess = await this.session.changePassword(this.user.id, params.password);
+		const actionsuccess = await this.session.changePassword(user.id, params.password);
 		return { actionsuccess };
 	},
 
@@ -464,14 +446,15 @@ export const actions: { [k: string]: QueryHandler } = {
 		if (!params.username) {
 			throw new ActionError(`Specify a username.`);
 		}
-		if (!this.user.loggedIn) {
+		const user = await this.getUser();
+		if (!user.loggedIn) {
 			throw new ActionError('Your session has expired. Please log in again.');
 		}
-		if (toID(params.username) !== this.user.id) {
+		if (toID(params.username) !== user.id) {
 			throw new ActionError('You\'re not logged in as that user.');
 		}
 		// safe to use userid directly because we've confirmed they've logged in.
-		const actionsuccess = await tables.users.update(this.user.id, {
+		const actionsuccess = await tables.users.update(user.id, {
 			username: params.username,
 		});
 		await this.session.setSid();
@@ -480,14 +463,15 @@ export const actions: { [k: string]: QueryHandler } = {
 
 	async getassertion(params) {
 		this.verifyCrossDomainRequest();
-		params.userid = toID(params.userid) || this.user.id;
+		const user = await this.getUser();
+		params.userid = toID(params.userid) || user.id;
 		// NaN is falsy so this validates
 		const challengekeyid = Number(params.challengekeyid) || -1;
 		const challenge = params.challenge || params.challstr || "";
 		return this.session.getAssertion(
 			params.userid,
 			challengekeyid,
-			this.user,
+			user,
 			challenge,
 			this.verifyCrossDomainRequest()
 		);
@@ -580,11 +564,11 @@ export const actions: { [k: string]: QueryHandler } = {
 			throw new ActionError(`Access denied for ${this.getIp()}.`);
 		}
 		const update = await updateserver();
-		let stderr;
-		[, , stderr] = await bash('npx tsc');
-		if (stderr) throw new ActionError(`Compilation failed:\n${stderr}`);
-		[, , stderr] = await bash('npx pm2 reload loginserver');
-		if (stderr) throw new ActionError(stderr);
+		let code, stdout, stderr;
+		[code, stdout, stderr] = await bash('npm run typecheck');
+		if (code) throw new ActionError(`Type checking failed:\n${stderr || stdout}`);
+		[code, stdout, stderr] = await bash('npm run reload');
+		if (code) throw new ActionError(stderr || stdout);
 		return { updated: update, success: true };
 	},
 
@@ -640,7 +624,7 @@ export const actions: { [k: string]: QueryHandler } = {
 		} catch (err) {
 			throw new ActionError(`Could not read color file (${err as any})`);
 		}
-		let entry = '';
+		let entry: string;
 		if (!('source' in params)) {
 			if (!colors[userid]) {
 				throw new ActionError(
@@ -783,20 +767,16 @@ export const actions: { [k: string]: QueryHandler } = {
 	// oauth/page - public-facing part
 	// oauth/api/page - api part (does the actual action)
 	async 'oauth/authorize'(params) {
-		this.allowCORS();
 		if (!params.redirect_uri) {
 			throw new ActionError("No redirect_uri provided");
 		}
-		const clientInfo = await getOAuthClient(params.client_id, this.request.headers.origin);
+		const client = await OAuth.getClient(params.client_id, params.redirect_uri, 'redirect_uri');
+		const user = await this.getUser();
 
 		this.response.setHeader('Content-Type', 'text/html');
 		try {
-			let content = OAUTH_AUTHORIZE_CONTENT;
-			// table keys are owner, clientName, id
-			// expects client, client_name, redirect_uri
-			content = content.replace(/\{\{client\}\}/g, escapeHTML(clientInfo.client_title));
-			content = content.replace(/\{\{client_name\}\}/g, escapeHTML(clientInfo.owner));
-			this.response.setHeader('Content-Length', content.length);
+			const content = OAuth.renderAuthorizePage(client, user.loggedIn ? user.name : '');
+			this.response.setHeader('Content-Length', Buffer.byteLength(content));
 			return content;
 		} catch (e) {
 			Server.crashlog(e, "oauth/authorize", params);
@@ -806,56 +786,36 @@ export const actions: { [k: string]: QueryHandler } = {
 
 	// make a token if they don't already have it
 	async 'oauth/api/authorize'(params) {
-		this.allowCORS();
-		if (!this.user.loggedIn) {
+		if (this.request.method !== 'POST') {
+			throw new ActionError("OAuth authorization requires POST.");
+		}
+		if (!OAuth.isSameOriginRequest(this.request.headers)) {
+			throw new ActionError("OAuth authorization requires a same-origin request.");
+		}
+		const user = await this.getUser();
+		if (!user.loggedIn) {
 			throw new ActionError("You're not logged in.");
 		}
-		const clientInfo = await getOAuthClient(params.client_id);
-		const existing = await (
-			tables.oauthTokens.selectOne()
-		)`WHERE client = ${clientInfo.id} AND owner = ${this.user.id}`;
-		if (existing) {
-			if (Date.now() - existing.time > OAUTH_TOKEN_TIME) { // 2w
-				await tables.oauthTokens.delete(existing.id);
-				return { success: false };
-			} else {
-				return { success: existing.id, user: this.user.id };
-			}
-		}
-		const id = crypto.randomBytes(16).toString('hex');
-		await tables.oauthTokens.insert({
-			id, owner: this.user.id, client: clientInfo.id, time: Date.now(),
-		});
-		return {
-			success: id,
-			expires: Date.now() + OAUTH_TOKEN_TIME,
-			user: this.user.id,
-		};
+		const client = await OAuth.getClient(params.client_id);
+		return OAuth.authorize(client, user.id);
 	},
 
 	async 'oauth/api/refreshtoken'(params) {
-		this.allowCORS();
-		const clientInfo = await getOAuthClient(params.client_id);
+		const origin = this.request.headers.origin;
+		const client = await OAuth.getClient(params.client_id, origin);
+		if (origin) this.allowCORS(origin);
 		const token = (params.token || "").toString();
 		if (!token) {
 			throw new ActionError('No token provided.');
 		}
-		const tokenEntry = await tables.oauthTokens.get(token);
-		if (!tokenEntry) {
-			return { success: false };
-		}
-		const id = crypto.randomBytes(16).toString('hex');
-		await tables.oauthTokens.insert({
-			id, owner: tokenEntry.owner, client: clientInfo.id, time: Date.now(),
-		});
-		await tables.oauthTokens.delete(tokenEntry.id);
-		return { success: id, expires: Date.now() + OAUTH_TOKEN_TIME };
+		return OAuth.refreshToken(client, token);
 	},
 
 	// validate assertion & get token if it's valid
 	async 'oauth/api/getassertion'(params) {
-		this.allowCORS();
-		await getOAuthClient(params.client_id);
+		const origin = this.request.headers.origin;
+		const client = await OAuth.getClient(params.client_id, origin);
+		if (origin) this.allowCORS(origin);
 		const token = (params.token || "").toString();
 		if (!token) {
 			throw new ActionError('No token provided.');
@@ -864,74 +824,52 @@ export const actions: { [k: string]: QueryHandler } = {
 		if (!challstr) {
 			throw new ActionError('No challstr provided.');
 		}
-		const tokenEntry = await tables.oauthTokens.get(token);
-		if (!tokenEntry || tokenEntry.id !== token) {
-			return { success: false };
-		}
-		if ((Date.now() - tokenEntry.time) > OAUTH_TOKEN_TIME) { // 2w
-			await tables.oauthTokens.delete(tokenEntry.id);
-			return { success: false };
-		}
-		this.user.login(tokenEntry.owner);
+		const owner = await OAuth.getTokenOwner(client, token);
+		if (!owner) return { success: false };
+		const user = await this.getUser();
+		user.login(owner);
 		return this.session.getAssertion(
-			this.user.id, Config.challengekeyid, this.user, challstr
+			user.id, Config.challengekeyid, user, challstr
 		);
 	},
 
 	'oauth/authorized'() {
-		this.allowCORS();
 		this.response.setHeader('Content-Type', 'text/html');
-		const content = OAUTH_AUTHORIZED_CONTENT;
-		this.response.setHeader('Content-Length', content.length);
+		const content = OAuth.authorizedPage;
+		this.response.setHeader('Content-Length', Buffer.byteLength(content));
 		return content;
 	},
 
 	async 'oauth/api/authorized'() {
-		if (!this.user.loggedIn) {
+		const user = await this.getUser();
+		if (!user.loggedIn) {
 			throw new ActionError("You're not logged in.");
 		}
-		const applications = [];
-		const tokens = await tables.oauthTokens.selectAll()`WHERE owner = ${this.user.id}`;
-		for (const token of tokens) {
-			const client = await tables.oauthClients.get(token.client);
-			if (!client) throw new Error("Tokens exist for nonexistent application");
-			applications.push({ title: client.client_title, url: client.origin_url });
-		}
 		return {
-			username: this.user.id,
-			applications,
+			username: user.id,
+			applications: await OAuth.getAuthorizedApplications(user.id),
 		};
 	},
 
 	async 'oauth/api/revoke'(params) {
-		if (!this.user.loggedIn) {
+		const user = await this.getUser();
+		if (!user.loggedIn) {
 			throw new ActionError("You're not logged in.");
 		}
-		if (!params.uri) {
-			throw new ActionError("Specify the URL of the application you wish to revoke access for.");
-		}
-		const client = await tables.oauthClients.selectOne()`WHERE origin_url = ${params.uri}`;
-		if (!client) {
-			throw new ActionError('No client found with that URL.');
-		}
-		const tokenEntry = await tables.oauthTokens.selectOne()`WHERE client = ${client.id}`;
-		if (!tokenEntry) {
-			throw new ActionError("That application doesn't have access granted to your account.");
-		}
-		await tables.oauthTokens.deleteAll()`WHERE client = ${client.id} and owner = ${this.user.id}`;
-		return { success: true };
+		return OAuth.revoke(user.id, params.uri);
 	},
 
 	async getteams(params) {
 		this.verifyCrossDomainRequest();
-		if (!this.user.loggedIn || this.user.id === 'guest') {
+		const user = await this.getUser();
+		if (!user.loggedIn || user.id === 'guest') {
 			return { loggedIn: false, teams: [] }; // don't wanna nag people with popups if they aren't logged in
 		}
-		let teams = [];
+		let teams;
 		try {
 			teams = await tables.teams.selectAll(
 				SQL`teamid, team, format, title as name, private`
-			)`WHERE ownerid = ${this.user.id}`;
+			)`WHERE ownerid = ${user.id}`;
 		} catch (e) {
 			Server.crashlog(e, 'a teams database query', params);
 			throw new ActionError('The server could not load your teams. Please try again later.');
@@ -948,9 +886,10 @@ export const actions: { [k: string]: QueryHandler } = {
 			// and fetch the team later
 			t.team = mons.join(',');
 		}
-		return { loggedIn: this.user.id, teams };
+		return { loggedIn: user.id, teams };
 	},
 	async getteam(params) {
+		const user = await this.getUser();
 		let { teamid, password, full, raw } = params;
 		teamid = toID(teamid);
 		password = toID(password);
@@ -961,11 +900,11 @@ export const actions: { [k: string]: QueryHandler } = {
 			const data = await tables.teams.selectOne(
 				full ? SQL`team, private, ownerid, format, title, views` : SQL`ownerid, team, private`
 			)`WHERE teamid = ${teamid}`;
-			const owns = data?.ownerid === this.user.id;
+			const owns = data?.ownerid === user.id;
 			if (!data || (owns ? false : (data.private && (password !== toID(data.private))))) {
 				return { team: null };
 			}
-			if ('views' in data && this.user.id !== data.ownerid) {
+			if ('views' in data && user.id !== data.ownerid) {
 				// we only increment views if it's a full load - since the teams client
 				// only uses getteam with full (which counts). otherwise it's just the
 				// builder loading it, which doesn't count
@@ -983,7 +922,8 @@ export const actions: { [k: string]: QueryHandler } = {
 		}
 	},
 	async editteam(params) {
-		if (!this.user.loggedIn || this.user.id === 'guest') {
+		const user = await this.getUser();
+		if (!user.loggedIn || user.id === 'guest') {
 			throw new ActionError("Must be logged in to edit teams.");
 		}
 		const teamid = Number(params.teamid);
@@ -994,7 +934,7 @@ export const actions: { [k: string]: QueryHandler } = {
 		if (!team) {
 			throw new ActionError("Team not found.");
 		}
-		if (team.ownerid !== this.user.id) {
+		if (team.ownerid !== user.id) {
 			throw new ActionError(`You cannot edit that team, as it is not yours.`);
 		}
 		const edit: Record<string, string | number | null> = {};
@@ -1025,7 +965,8 @@ export const actions: { [k: string]: QueryHandler } = {
 		return { success: true, team: await tables.teams.get(team.teamid) };
 	},
 	async deleteteam(params) {
-		if (!this.user.loggedIn || this.user.id === 'guest') {
+		const user = await this.getUser();
+		if (!user.loggedIn || user.id === 'guest') {
 			throw new ActionError("Must be logged in to edit teams.");
 		}
 		const teamid = Number(params.teamid);
@@ -1036,7 +977,7 @@ export const actions: { [k: string]: QueryHandler } = {
 		if (!team) {
 			throw new ActionError("Team not found.");
 		}
-		if (team.ownerid !== this.user.id) {
+		if (team.ownerid !== user.id) {
 			throw new ActionError(`You cannot delete that team, as it is not yours.`);
 		}
 		await tables.teams.deleteAll()`WHERE teamid = ${teamid}`;
@@ -1044,7 +985,8 @@ export const actions: { [k: string]: QueryHandler } = {
 	},
 	async copyteam(params) {
 		let { teamid, password } = params;
-		if (!this.user.loggedIn) {
+		const user = await this.getUser();
+		if (!user.loggedIn) {
 			throw new ActionError("Must be logged in to copy teams.");
 		}
 		teamid = toID(teamid);
@@ -1055,7 +997,7 @@ export const actions: { [k: string]: QueryHandler } = {
 		const data = await tables.teams.selectOne(
 			SQL`team, private, ownerid, format, title`
 		)`WHERE teamid = ${teamid}`;
-		const owns = data?.ownerid === this.user.id;
+		const owns = data?.ownerid === user.id;
 		if (!data || (owns ? false : (data.private && (password !== toID(data.private))))) {
 			throw new ActionError("Access denied");
 		}
@@ -1066,14 +1008,15 @@ export const actions: { [k: string]: QueryHandler } = {
 			format: data.format,
 			title: `Copy of '${data.title}' by ${data.ownerid}`,
 			views: 0,
-			ownerid: this.user.id,
+			ownerid: user.id,
 			date: new Date().toISOString(),
 		}}) RETURNING *;`;
 		return { teamid: `${result[0].teamid}-${newPw}` };
 	},
 	async searchteams(params) {
 		let count = Number(params.count) || 20;
-		if (!this.user.loggedIn || this.user.id === 'guest') {
+		const user = await this.getUser();
+		if (!user.loggedIn || user.id === 'guest') {
 			count = 20; // limit results just to be safe
 		}
 		const args = SQL``;
@@ -1112,10 +1055,11 @@ export const actions: { [k: string]: QueryHandler } = {
 		this.allowCORS();
 		return Replays.recent();
 	},
-	'replays/check-login'(params) {
+	async 'replays/check-login'(params) {
+		const user = await this.getUser();
 		return (
-			DISPATCH_PREFIX + `${this.user.id},` +
-			`${Config.sysops.includes(this.user.id) ? 1 : ''}`
+			DISPATCH_PREFIX + `${user.id},` +
+			`${user.isSysop() ? 'sysop' : user.isLeader() ? 'leader' : ''}`
 		);
 	},
 	async 'replays/search'(params) {
@@ -1202,7 +1146,8 @@ export const actions: { [k: string]: QueryHandler } = {
 	async 'replays/searchprivate'(params) {
 		this.verifyCrossDomainRequest();
 
-		if (!this.user.loggedIn) throw new ActionError(`Access denied: You must be logged in.`);
+		const user = await this.getUser();
+		if (!user.loggedIn) throw new ActionError(`Access denied: You must be logged in.`);
 		if (params.sort && params.sort !== 'rating' && params.sort !== 'date') {
 			throw new ActionError('Sort must be "rating" or "date"');
 		}
@@ -1221,7 +1166,7 @@ export const actions: { [k: string]: QueryHandler } = {
 		if (params.page && before) {
 			throw new ActionError(`Cannot set both "page" and "before", please choose one method of pagination`);
 		}
-		if (!(this.user.isSysop() || usernames.includes(this.user.id))) {
+		if (!(user.isSysop() || usernames.includes(user.id))) {
 			throw new ActionError(`Access denied: You must be logged in as a username you're searching for.`);
 		}
 
@@ -1235,41 +1180,25 @@ export const actions: { [k: string]: QueryHandler } = {
 		return Replays.search(search);
 	},
 	async 'replays/edit'(params) {
-		if (!this.user.isLeader()) throw new ActionError(`Access denied.`);
-		const id = toID(params.id);
+		const user = await this.getUser();
+		if (!user.isLeader()) throw new ActionError(`Access denied.`);
+		const id = (params.id || '').toLowerCase();
+		if (id && !/^[a-z0-9-]+$/.test(id)) throw new ActionError(`Invalid replay ID.`);
 		if (!id) throw new ActionError(`No replay ID was provided.`);
-		const replay = await tables.replays.get(id);
+		const replay = await Replays.get(id);
 		if (!replay) throw new ActionError(`Replay ${id} not found.`);
-		let pw;
 		switch (Number(params.private)) {
 		case 3:
-			await tables.replays.update(id, {
-				password: null,
-				private: 3,
-			});
-			break;
-		case 2: // private [1], no pass
-			await tables.replays.update(id, {
-				private: 1,
-				password: null,
-			});
-			break;
+		case 2:
 		case 1:
-			if (!replay.password) replay.password = Replays.generatePassword();
-			pw = replay.password;
-			await tables.replays.update(id, {
-				private: 1,
-				password: replay.password,
-			});
+		case 0:
+			replay.private = Number(params.private) as 0;
 			break;
 		default:
-			await tables.replays.update(id, {
-				password: null,
-				private: 0,
-			});
-			break;
+			throw new ActionError(`Invalid private value: ${params.private!}`);
 		}
-		return { password: pw };
+		const editedReplay = await Replays.edit(replay);
+		return { password: editedReplay.password || undefined };
 	},
 	async 'replays/batch'(params) {
 		if (!params.ids) {
@@ -1278,6 +1207,64 @@ export const actions: { [k: string]: QueryHandler } = {
 		const ids = params.ids.split(',');
 		if (ids.length > 51) throw new ActionError(`Limit 51 IDs (you have ${ids.length}).`);
 		return Replays.getBatch(ids);
+	},
+	async 'replays/get.json'(params) {
+		if (params.manage === undefined) this.allowCORS();
+		const [id, password] = Replays.splitPasswordSuffix(params.id || '');
+		const replay = id ? await Replays.get(id, params.countview !== undefined) : undefined;
+		if (!replay || (replay.password && replay.password !== password)) {
+			this.response.statusCode = 404;
+			return '';
+		}
+
+		if (replay.inputlog) {
+			if (params.manage !== undefined) {
+				const user = await this.getUser();
+				if (!user.isLeader()) throw new ActionError('Access denied: not logged in as an admin');
+			} else if (!Replays.isSafeInputlog(replay.formatid!)) {
+				delete replay.inputlog;
+			}
+		}
+		this.setHeader('Content-Type', 'application/json');
+		return JSON.stringify(replay);
+	},
+	async 'replays/get.log'(params) {
+		this.allowCORS();
+		const [id, password] = Replays.splitPasswordSuffix(params.id || '');
+		const replay = id ? await tables.replays.get(id, ['id', 'password', 'log']) : undefined;
+		if (!replay || (replay.password && replay.password !== password)) {
+			this.response.statusCode = 404;
+			return '';
+		}
+		return replay.log;
+	},
+	async 'replays/get.inputlog'(params) {
+		if (params.manage === undefined) this.allowCORS();
+		const fullid = params.id || '';
+		const [id, password] = Replays.splitPasswordSuffix(fullid);
+		const replay = id ? await tables.replays.get(id, ['id', 'password', 'formatid', 'inputlog']) : undefined;
+		if (!replay || (replay.password && replay.password !== password)) {
+			this.response.statusCode = 404;
+			return '';
+		}
+		if (replay.inputlog) {
+			if (params.manage !== undefined) {
+				const user = await this.getUser();
+				if (!user.isLeader()) throw new ActionError('Access denied: not logged in as an admin');
+			} else if (!Replays.isSafeInputlog(replay.formatid)) {
+				this.response.statusCode = 403;
+				return (
+					`[access denied: not a random battle]\n\n` +
+					`If you are an admin, you can get this using: ` +
+					`https://replay.pokemonshowdown.com/${fullid}.inputlog?manage`
+				);
+			}
+		}
+		if (!replay.inputlog) {
+			this.response.statusCode = 410;
+			return '[inputlog not found]';
+		}
+		return replay.inputlog;
 	},
 	// sent by ps server
 	async 'smogon/validate'(params) {

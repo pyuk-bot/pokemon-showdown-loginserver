@@ -3,17 +3,18 @@
  *
  * @author mia-pi-git, Zarel
  */
-import * as http from 'http';
-import * as https from 'https';
-import * as child from 'child_process';
-import * as dns from 'dns';
-import * as fs from 'fs';
-import { toID, md5 } from './utils';
-import { Config } from './config-loader';
-import { actions } from './actions';
-import { type User, Session } from './user';
-import { URLSearchParams } from 'url';
-import IPTools from './ip-tools';
+import * as http from 'node:http';
+import * as https from 'node:https';
+import * as child from 'node:child_process';
+import * as dns from 'node:dns';
+import * as fs from 'node:fs';
+import * as net from 'node:net';
+import * as module from 'node:module';
+import { toID, md5 } from './utils.ts';
+import { Config } from './config-loader.ts';
+import { actions } from './actions.ts';
+import { type User, Session } from './user.ts';
+import IPTools from './ip-tools.ts';
 
 /**
  * API request output should not be valid JavaScript.
@@ -79,7 +80,7 @@ export class ActionContext {
 	readonly response: http.ServerResponse;
 	readonly session: Session;
 	readonly ActionError = ActionError;
-	user: User;
+	private userPromise?: Promise<User>;
 	private prefix: string | null = null;
 	readonly body: ActionRequest;
 	useDispatchPrefix = true;
@@ -87,8 +88,11 @@ export class ActionContext {
 		this.request = req;
 		this.response = res;
 		this.session = new Session(this);
-		this.user = null!;
 		this.body = body;
+	}
+	getUser(): Promise<User> {
+		if (!this.userPromise) this.userPromise = this.session.getUser();
+		return this.userPromise;
 	}
 	async executeActions() {
 		const body = this.body;
@@ -100,12 +104,11 @@ export class ActionContext {
 		// the cookies are actually the only CSRF risk,
 		// so there's no problem setting CORS
 		// if they send it directly
-		if (ActionContext.parseURLRequest(this.request).sid?.length) {
+		if (body.sid?.length) {
 			this.setHeader('Access-Control-Allow-Origin', '*');
 		}
 
 		try {
-			this.user = await this.session.getUser();
 			const result = await handler.call(this, body);
 
 			if (result === null) return { code: 404 };
@@ -263,11 +266,13 @@ export const SimServers = new class SimServersT {
 	servers: { [k: string]: RegisteredServer } = this.loadServers();
 	hostCache = new Map<string, string>();
 	constructor() {
-		fs.watchFile(Config.serverlist, (curr, prev) => {
-			if (curr.mtime > prev.mtime) {
-				this.loadServers();
-			}
-		});
+		if (Config.watchconfig) {
+			fs.watchFile(Config.serverlist, (curr, prev) => {
+				if (curr.mtime > prev.mtime) {
+					this.loadServers();
+				}
+			});
+		}
 	}
 
 	async getHost(server: string) {
@@ -311,7 +316,7 @@ export const SimServers = new class SimServersT {
 		if (!path) return {};
 		try {
 			const stdout = child.execFileSync(
-				`php`, ['-f', __dirname + '/../../src/lib/load-servers.php', path]
+				`php`, ['-f', import.meta.dirname + '/lib/load-servers.php', path]
 			).toString();
 			return JSON.parse(stdout);
 		} catch (e: any) {
@@ -329,14 +334,14 @@ export class Server {
 	awaitingEnd?: () => void;
 	closing?: Promise<void>;
 	activeRequests = 0;
-	constructor(port = (Config.port || 8000), host = (Config.bindaddress || "0.0.0.0")) {
+	constructor(port: number | null = (Config.port || 8000), host = (Config.bindaddress || "0.0.0.0")) {
 		this.host = host;
-		this.port = port;
+		this.port = port || 0;
 
 		this.server = http.createServer((req, res) => void this.handle(req, res));
-		this.server.listen(port, host);
+		if (port !== null) this.server.listen(port, host);
 		this.httpsServer = null;
-		if (Config.ssl) {
+		if (Config.ssl && port !== null) {
 			this.httpsServer = https.createServer(Config.ssl, (req, res) => void this.handle(req, res));
 			this.httpsServer.listen(Config.ssl.port || 8043);
 		}
@@ -346,6 +351,7 @@ export class Server {
 			return console.log(`${source} crashed`, error, details);
 		}
 		try {
+			const require = module.createRequire(import.meta.url);
 			const { crashlogger } = require(Config.pspath);
 			crashlogger(error, source, { ...details, date: new Date().toISOString() }, Config.crashguardemail);
 		} catch (e) {
@@ -383,7 +389,7 @@ export class Server {
 				if (!context.useDispatchPrefix) useDispatchPrefix = false;
 			}
 			this.ensureHeaders(res);
-			res.writeHead(200).end(this.stringify(result, useDispatchPrefix));
+			res.writeHead(res.statusCode).end(this.stringify(result, useDispatchPrefix));
 		} catch (e: any) {
 			this.ensureHeaders(res);
 			if (e?.name?.endsWith('ActionError')) {
@@ -400,11 +406,20 @@ export class Server {
 		this.activeRequests--;
 		if (!this.activeRequests) this.awaitingEnd?.();
 	}
+	async request(act: string, bodyData?: Partial<ActionRequest>) {
+		const req = new http.IncomingMessage(new net.Socket());
+		req.method = 'POST';
+		const body = ActionContext.sanitizeBody({ act, ...bodyData });
+		const context = new ActionContext(req, new http.ServerResponse(req), body);
+
+		return { result: await context.executeActions() as any, context };
+	}
 	ensureHeaders(res: http.ServerResponse) {
 		if (this.awaitingEnd) res.setHeader('Connection', 'close');
 	}
 	close() {
 		if (this.closing) return this.closing;
+		if (!this.server.listening && !this.activeRequests) return Promise.resolve();
 		this.server.close();
 		if (!this.activeRequests) return Promise.resolve();
 		this.closing = new Promise<void>(resolve => {
@@ -423,4 +438,4 @@ export class Server {
 	}
 }
 
-void IPTools.loadPrivateRelayIPs();
+if (Config.loadprivaterelayips) void IPTools.loadPrivateRelayIPs();

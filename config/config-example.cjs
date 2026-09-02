@@ -1,16 +1,18 @@
-/** For the login and ladder databases */
-exports.mysql = {
-	charset: "utf8",
-	database: "ps",
-	password: "",
-	host: 'localhost',
-	user: "root",
-	socketPath: '',
-	prefix: "ntbb_",
-};
+/**
+ * @typedef {'mysql' | 'postgres' | 'sqlite' | 'mock'} DatabaseDriver
+ * @typedef {{driver: DatabaseDriver, prefix?: string, path?: string}} BasicDatabaseConfig
+ * @typedef {import('mysql2').PoolOptions & BasicDatabaseConfig & {driver: 'mysql'}} MySQLDatabaseConfig
+ * @typedef {import('pg').PoolConfig & BasicDatabaseConfig & {driver: 'postgres'}} PGDatabaseConfig
+ * @typedef {{path: string} & BasicDatabaseConfig & {driver: 'mock'}} MockDatabaseConfig
+ * @typedef {MySQLDatabaseConfig | PGDatabaseConfig | MockDatabaseConfig} DatabaseConfig
+ */
 
-/** For the replay databases */
-exports.replaysdb = {
+/**
+ * For logins and ladders
+ * @type {DatabaseConfig}
+ */
+exports.logindb = {
+	driver: "mysql",
 	charset: "utf8",
 	database: "ps",
 	password: "",
@@ -21,11 +23,31 @@ exports.replaysdb = {
 };
 
 /**
- * For the friends database
- *
- * @type {import('pg').PoolConfig | null}
+ * For replays
+ * @type {DatabaseConfig | null | undefined}
  */
-exports.postgres = null;
+exports.replaysdb = {
+	driver: "postgres",
+	database: "ps",
+	password: "",
+	host: 'localhost',
+	user: "root",
+	prefix: "ntbb_",
+};
+
+/**
+ * For ladders
+ * @type {DatabaseConfig | null | undefined}
+ */
+exports.ladderdb = null;
+
+/**
+ * For friends
+ * @type {DatabaseConfig | null | undefined}
+ */
+exports.friendsdb = null;
+
+// ====================================================================
 
 /** For 2FA verification. */
 exports.gapi_clientid = '';
@@ -76,6 +98,8 @@ exports.compromisedkeys = [];
 /** proxies to trust x-forwarded-for from
  * @type {string[]} */
 exports.trustedproxies = [];
+/** @type {boolean} */
+exports.loadprivaterelayips = true;
 
 /**
     * [Places to allow cors requests from, prefix to use][]
@@ -102,14 +126,6 @@ exports.privatekey = '';
 // current active challengekeyid (backwards compatibility)
 /** @type {number} */
 exports.challengekeyid = 4;
-
-/**
- * DBs.
- */
-/** @type {typeof exports.mysql | undefined} */
-exports.replaysdb = undefined;
-/** @type {typeof exports.mysql | undefined} */
-exports.ladderdb = undefined;
 
 /**
  * For emailing crashes.
@@ -170,7 +186,7 @@ exports.smogonip = null;
 exports.smogonpath = null;
 /**
  * Custom actions for your loginserver.
- * @type {{[k: string]: import('../src/server').QueryHandler} | null}
+ * @type {{[k: string]: import('../src/server.ts').QueryHandler} | null}
  */
 exports.actions = null;
 
@@ -194,14 +210,14 @@ exports.standings = {
 };
 
 /**
- * @type {null | ((userid: string) => Promise<{[k: string]: {min: number, max: number, count: number}}>)}
  * Get IPs of a given userid.
+ * @type {null | ((userid: string) => Promise<{[k: string]: {min: number, max: number, count: number}}>)}
  */
 exports.getuserips = null;
 
 /**
- * @type {string | null}
  * Index of suspect tests active
+ * @type {string | null}
  */
 exports.suspectpath = null;
 

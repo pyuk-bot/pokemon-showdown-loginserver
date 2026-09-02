@@ -1,27 +1,23 @@
 /**
- * Tests for all actions the loginserver can perform.
- * By Mia.
- * @author mia-pi-git
+ * Tests for loginserver actions.
  */
-import { strict as assert } from 'assert';
-import { Ladder } from '../ladder';
-import { toID } from '../utils';
-import * as utils from './test-utils';
-import * as tables from '../tables';
+import { strict as assert } from 'node:assert';
+import * as crypto from 'node:crypto';
+import { after, suite, test } from 'node:test';
+
+import { Ladder } from '../ladder.ts';
+import { Server } from '../server.ts';
+import * as tables from '../tables.ts';
+import { toID } from '../utils.ts';
 
 const token = '42354y6dhgfdsretr';
-describe('Loginserver actions', () => {
-	/* const server = */ utils.addServer({
-		id: 'showdown',
-		name: 'Etheria',
-		port: 8000,
-		server: 'despondos.psim.us',
-		token,
-	});
 
-	it('Should properly log userstats and userstats history', async () => {
-		const { result } = await utils.testDispatcher({
-			act: 'updateuserstats',
+void suite('Loginserver actions', () => {
+	const server = new Server(null);
+	void after(() => server.close());
+
+	void test('Should properly log userstats and userstats history', async () => {
+		const { result } = await server.request('updateuserstats', {
 			users: '20',
 			date: `${Date.now()}`,
 			servertoken: token,
@@ -30,57 +26,67 @@ describe('Loginserver actions', () => {
 		assert(result.actionsuccess);
 	});
 
-	// users
-	describe('Users features', () => {
-		it('Should properly register users', async () => {
-			// erase the user so the test runs uncorrupted
+	void suite('Users features', () => {
+		void test("Should register and log in a user, then change the user's password", async () => {
 			await tables.users.delete('catra').catch(() => null);
-
-			const { result } = await utils.testDispatcher({
-				act: 'register',
+			const registration = await server.request('register', {
 				username: 'Catra',
 				password: 'applesauce',
 				cpassword: 'applesauce',
 				captcha: 'pikachu',
-				challstr: await utils.randomBytes(),
+				challstr: crypto.randomBytes(128).toString('hex'),
 				challengekeyid: '1',
 			});
+			// note: actionsuccess is false here because test config has no signing key
+			assert(registration.result.curuser.userid === 'catra');
+			assert(await tables.users.get('catra'), 'User was not registered');
 
-			assert(result.curuser.userid === 'catra');
-			assert(result.actionsuccess);
-		});
-
-		it('Should log in a user', async () => {
-			const { result } = await utils.testDispatcher({
-				act: 'login',
+			const login = await server.request('login', {
 				name: 'catra',
 				pass: 'applesauce',
 				challengekeyid: '1',
-				challstr: await utils.randomBytes(),
-			}, context => context.session.addUser('Catra', 'applesauce').catch(() => null));
-			assert(result.actionsuccess, 'User was not logged in');
-			assert(result.assertion.split(';').length > 1);
-		});
+				challstr: crypto.randomBytes(128).toString('hex'),
+			});
+			assert(login.result.actionsuccess, 'User was not logged in');
+			assert(login.result.assertion.split(';').length > 1);
 
-		it("should change the user's password", async () => {
-			const { result } = await utils.testDispatcher({
-				act: 'changepassword',
+			const setCookie = login.context.response.getHeader('Set-Cookie');
+			assert(typeof setCookie === 'string');
+			const cookieMatch = /^sid=([^;]+)/.exec(setCookie);
+			assert(cookieMatch, 'Login did not set a session cookie');
+			const sid = decodeURIComponent(cookieMatch[1]);
+
+			const { result } = await server.request('changepassword', {
 				username: 'Catra',
 				oldpassword: 'applesauce',
 				cpassword: 'greyskull',
 				password: 'greyskull',
-			}, context => context.user.login('catra'));
-			assert(result, 'Received falsy success');
+				sid,
+			});
+			assert(result.actionsuccess, 'Received falsy success');
+
+			const oldPasswordLogin = await server.request('login', {
+				name: 'catra',
+				pass: 'applesauce',
+				challengekeyid: '1',
+				challstr: crypto.randomBytes(128).toString('hex'),
+			});
+			assert.equal(oldPasswordLogin.result.actionerror, 'Wrong password.');
+
+			const newPasswordLogin = await server.request('login', {
+				name: 'catra',
+				pass: 'greyskull',
+				challengekeyid: '1',
+				challstr: crypto.randomBytes(128).toString('hex'),
+			});
+			assert(newPasswordLogin.result.actionsuccess, 'User could not log in with the new password');
 		});
 	});
 
-	// it('Should prepare replays', async () => {
-	// 	// clear old
-	// 	await tables.prepreplays.delete('gen8randombattle-3096');
-
-	// 	// as long as it doesn't throw, we're fine
-	// 	await utils.testDispatcher({
-	// 		act: 'prepreplay',
+	// prepreplay no longer exists
+	// void test('Should prepare replays', async () => {
+	// 	await tables.replayPrep.delete('gen8randombattle-3096').catch(() => null);
+	// 	await server.request('prepreplay', {
 	// 		id: 'gen8randombattle-3096',
 	// 		loghash: 'ec4730e807719f9b94327f4b5ab28034',
 	// 		p1: 'Adora',
@@ -99,49 +105,42 @@ describe('Loginserver actions', () => {
 	// 			'>player p2 {"name":"Catra","avatar":"miapi.png","rating":1069,"seed":[35058,54063,46942,19311]}',
 	// 		].join('\n'),
 	// 	});
-
-	// 	const cached = await tables.prepreplays.get(
-	// 		'gen8randombattle-3096'
-	// 	);
+	// 	const cached = await tables.replayPrep.get('gen8randombattle-3096');
 	// 	assert(cached, 'Could not locate entry for prepped replay');
 	// });
 
-	describe('Ladder', () => {
-		it('Should update the ladder', async () => {
+	void suite('Ladder', () => {
+		void test('Should update the ladder', async () => {
 			for (const id of ['catra', 'adora']) {
-				// clear their ratings entirely
-				await tables.ladder.deleteOne()`userid = ${id} AND formatid = ${'gen1randombattle'}`;
+				await tables.ladder.deleteOne()`WHERE userid = ${id} AND formatid = ${'gen1randombattle'}`;
 			}
-			const { result } = await utils.testDispatcher({
-				act: 'ladderupdate',
+			const { result } = await server.request('ladderupdate', {
 				serverid: 'showdown',
 				servertoken: token,
 				p1: 'Catra',
 				p2: 'Adora',
 				format: 'gen1randombattle',
-				score: '1', // score 1 means p1 wins
+				score: '1',
 			});
 			assert(result.p1rating.elo === 1040, 'Received winner elo of ' + result.p1rating.elo);
 			assert(result.p2rating.elo === 1000, 'Received loser elo of ' + result.p2rating.elo);
 		});
 
-		it('Should fetch the MMR for a given user', async () => {
+		void test('Should fetch the MMR for a given user', async () => {
 			const ladder = new Ladder('gen5randombattle');
 			const p1 = 'shera';
 			const p2 = 'catra';
 			for (const player of [p1, p2]) {
 				await tables.ladder.deleteAll()`WHERE userid = ${toID(player)} AND formatid = ${ladder.formatid}`;
 			}
-			const [p1r, _p2r] = await ladder.addMatch(p1, p2, 1);
-			const { result } = await utils.testDispatcher({
-				act: 'mmr',
+			const [p1rating] = await ladder.addMatch(p1, p2, 1);
+			const { result } = await server.request('mmr', {
 				format: 'gen5randombattle',
 				user: 'shera',
 				serverid: 'showdown',
 				servertoken: token,
 			});
-
-			assert.strictEqual(p1r.elo, result, `Expected elo ${p1r.elo}, got ${result}`);
+			assert.strictEqual(p1rating.elo, result, `Expected elo ${p1rating.elo}, got ${result}`);
 		});
 	});
 });

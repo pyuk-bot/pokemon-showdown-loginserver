@@ -5,37 +5,17 @@
  * Ported to TypeScript by Annika and Mia.
  * Ported to Postgres by Zarel.
  */
-import { toID, time } from './utils';
-import { replayPlayers, replays } from './tables';
-import { SQL } from './database';
-import * as crypto from 'crypto';
+import { toID, time } from './utils.ts';
+import { replayPlayers, replays, type ReplayRow } from './tables.ts';
+import { SQL } from './database.ts';
+import * as crypto from 'node:crypto';
 
-// must be a type and not an interface to qualify as an SQLRow
-export type ReplayRow = {
-	id: string,
-	format: string,
-	/** player names delimited by `,`; starting with `!` denotes that player wants the replay private */
-	players: string,
-	log: string,
-	inputlog: string | null,
-	uploadtime: number,
-	views: number,
-	formatid: string,
-	rating: number | null,
-	/**
-	 * 0 = public
-	 * 1 = private (with or without password)
-	 * 2 = NOT USED; ONLY USED IN PREPREPLAY
-	 * 3 = deleted
-	 * 10 = autosaved
-	 */
-	private: 0 | 1 | 2 | 3 | 10,
-	password: string | null,
-};
-type Replay = Omit<ReplayRow, 'formatid' | 'players' | 'password' | 'views'> & {
+type Replay = Omit<ReplayRow, 'players' | 'password' | 'views' | 'formatid' | 'inputlog'> & {
 	players: string[],
 	views?: number,
 	password?: string | null,
+	formatid?: string,
+	inputlog?: string | null,
 };
 
 export const Replays = new class {
@@ -64,6 +44,7 @@ export const Replays = new class {
 		const replayData: ReplayRow = {
 			password: null,
 			views: 0,
+			inputlog: null,
 			...replay,
 			players: replay.players.join(','),
 			formatid,
@@ -116,18 +97,48 @@ export const Replays = new class {
 		return fullid;
 	}
 
-	async get(id: string): Promise<Replay | null> {
+	async get(id: string, countView?: boolean): Promise<Replay | null> {
 		const replayData = await replays.get(id);
 		if (!replayData) return null;
 
-		await replays.update(replayData.id, { views: SQL`views + 1` });
+		if (countView) await replays.update(replayData.id, { views: SQL`views + 1` });
 
 		return this.toReplay(replayData);
 	}
 
+	/** Get, but without incrementing view count. */
+	fetch(this: void, id: string, fields?: (keyof ReplayRow & string)[]) {
+		return replays.get(id, fields);
+	}
+	/** Parses the `-{password}pw` suffix. */
+	splitPasswordSuffix(this: void, fullid: string): [id: string, password: string | null] {
+		if (fullid.endsWith('pw')) {
+			const dashpos = fullid.lastIndexOf('-');
+			if (dashpos > 0) {
+				return [fullid.slice(0, dashpos), fullid.slice(dashpos + 1, -2)];
+			}
+		}
+		return [fullid, null];
+	}
+	isSafeInputlog(this: void, formatid: string) {
+		return (
+			formatid.endsWith('randombattle') ||
+			formatid.endsWith('randomdoublesbattle') ||
+			formatid.endsWith('challengecup') ||
+			formatid.endsWith('challengecup1v1') ||
+			formatid.endsWith('battlefactory') ||
+			formatid.endsWith('bssfactory') ||
+			formatid.endsWith('hackmonscup')
+		);
+	}
+
+	/** can currently only edit privacy level */
 	async edit(replay: Replay) {
 		const replayData = this.toReplayRow(replay);
-		await replays.update(replay.id, { private: replayData.private, password: replayData.password });
+		const update = { private: replayData.private, password: replayData.password };
+		await replays.update(replay.id, update);
+		await replayPlayers.updateAll(update)`WHERE id = ${replay.id}`;
+		return replayData;
 	}
 
 	generatePassword(length = 31) {
